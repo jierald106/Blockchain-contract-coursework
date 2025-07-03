@@ -1,0 +1,46 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.30;
+
+// 引入 OpenZeppelin ERC20 标准
+import "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/v4.9.0/contracts/token/ERC20/ERC20.sol";
+import "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/v4.9.0/contracts/access/Ownable.sol";
+
+
+/// @title 简易 ICO：部署时自动铸币并按固定汇率卖币
+contract MyToken is ERC20 {
+    constructor(uint256 initialSupply) ERC20("GToken", "GTK") {
+        // 部署时把 initialSupply * 10^decimals() 发给部署者
+        _mint(msg.sender, initialSupply * 10 ** decimals());
+    }
+}
+
+contract TokenSale is Ownable {
+    MyToken public token;    /// 被售卖的代币
+    uint256 public rate;     /// 1 ETH 能换多少代币（不含 decimals）
+
+    /// @param _initialSupply ICO 合约部署后，先给它多少代币可售
+    /// @param _rate 兑换汇率（比如填 100 表示 1 ETH 换 100 个 GToken）
+    constructor(uint256 _initialSupply, uint256 _rate) {
+        // 部署一个新的 MyToken，铸造 _initialSupply 给 TokenSale 合约自己
+        token = new MyToken(_initialSupply);
+        rate = _rate;
+        
+        // 将 token 合约的所有权转给部署者（可选，用于未来管理）
+        transferOwnership(msg.sender);
+    }
+
+    /// @notice 用 ETH 买代币
+    function buyTokens() external payable {
+        require(msg.value > 0, "Send ETH to buy tokens");
+        // 计算用户应得代币数量
+        uint256 amount = msg.value * rate;
+        // 把代币从合约余额转给买家
+        require(token.balanceOf(address(this)) >= amount, "Not enough tokens in sale");
+        token.transfer(msg.sender, amount);
+    }
+
+    /// @notice 管理员提取合约里的 ETH
+    function withdraw() external onlyOwner {
+        payable(owner()).transfer(address(this).balance);
+    }
+}
