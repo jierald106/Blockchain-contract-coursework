@@ -1,17 +1,48 @@
-// scripts/refund1155.js
-const hre = require("hardhat");
-const { ethers, network } = hre;
+// scripts/withdraw1155.js
+const { ethers, network } = require("hardhat");
 
-async function main() {
-  const [, user] = await ethers.getSigners();
-  const ICO1155 = "0x666cEFa019aDd482C8f08c79F2EaFEb2dC870232";
-  const ico1155 = await ethers.getContractAt("AdvancedICO1155", ICO1155);
+// -------- helpers --------
+const fmtTok = v => (ethers.formatUnits ? ethers.formatUnits(v, 18)
+                                        : ethers.utils.formatUnits(v, 18));
+const fmtEth = v => (ethers.formatEther  ? ethers.formatEther(v)
+                                        : ethers.utils.formatEther(v));
 
-  // —— 必须先 finalize，否则会 revert "No refund" —— 
-  // （你可以在 finalize1155.js 后直接跑本脚本）
-  console.log(`⏳ ${user.address} 调用 claimRefund()…`);
-  await (await ico1155.connect(user).claimRefund()).wait();
-  console.log("✅ refund1155 完成");
+async function main () {
+  const [owner] = await ethers.getSigners();
+  const ICO_ADDR = "0x5623AeBD9883783e3814f3dfd3d8B40211327B2e";                    // ★ 请替换
+  const ico      = await ethers.getContractAt("AdvancedICO1155", ICO_ADDR);
+
+  /* 1️⃣ 检查赎回窗口是否已结束 */
+  const end = await ico.redemptionEnd();
+  const rn  = BigInt((await ethers.provider.getBlock("latest")).timestamp);
+  const endBn = typeof end === "bigint" ? end : end.toBigInt();
+
+  if (endBn > 0n && rn <= endBn) {
+    console.log("⏳ 赎回期还没结束，先别 withdraw");
+    return;                                        // 直接退出脚本
+  }
+
+  /* 2️⃣ 打印提钱前 ETH 余额 */
+  const balWei = await ethers.provider.getBalance(ICO_ADDR);
+  console.log("ICO 当前余额:", fmtEth(balWei), "ETH");
+
+  /* 3️⃣ 调用 withdraw（内部会 burnAllRemaining） */
+  const tx = await ico.connect(owner).withdraw();
+  const rc = await tx.wait();
+
+  /* 4️⃣ 解析 Burned 事件并打印 */
+  const evt = rc.logs
+                 .map(l => ico.interface.parseLog(l))
+                 .find(p => p && p.name === "Burned");
+
+  if (evt) {
+    const { icoBefore, ownerBefore, icoAfter, ownerAfter } = evt.args;
+    console.log(`✅ withdraw 完成，同时烧毁:
+    ICO   : ${fmtTok(icoBefore)}  →  ${fmtTok(icoAfter)}
+    Owner : ${fmtTok(ownerBefore)}  →  ${fmtTok(ownerAfter)}`);
+  } else {
+    console.log("✅ withdraw 完成（本次无 Burn 事件）");
+  }
 }
 
 main().catch(console.error);

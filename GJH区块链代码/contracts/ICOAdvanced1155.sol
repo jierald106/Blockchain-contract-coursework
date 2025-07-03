@@ -2,90 +2,91 @@
 pragma solidity ^0.8.28;
 
 import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
+import "@openzeppelin/contracts/token/ERC1155/extensions/ERC1155Burnable.sol";
 import "@openzeppelin/contracts/token/ERC1155/utils/ERC1155Holder.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /**
  * @title AdvancedICO1155
- * @dev ERC1155 版 ICO，支持：
- *   1) Cliff + Vesting 锁仓释放
- *   2) 动态汇率 setRate()
- *   3) 代币赎回（用户退回已领 token 换 ETH）
- *   4) 代币销毁（Owner 回收后 burnUnsold）
+ * @notice 失败场景 ➜ 退款完后 Owner 手动 burnAllRemaining()；
+ *         成功场景 ➜ withdraw() 自动 burnAllRemaining()。
  */
 contract AdvancedICO1155 is Ownable, ReentrancyGuard, ERC1155Holder {
+    /* --------------------------------------------------------------------- */
+    /* 基本参数                                                               */
+    /* --------------------------------------------------------------------- */
     IERC1155 public immutable token;
-    uint256 public immutable tokenId;
+    uint256  public immutable tokenId;
 
-    uint256 public rate;            // 1 ETH -> rate tokenUnits（1e18 计）
-    uint256 public startTime;
-    uint256 public endTime;
-    uint256 public softCap;
-    uint256 public hardCap;
-    uint256 public cliffDuration;
-    uint256 public vestingDuration;
+    uint256  public constant RATE_PHASE1 = 1500 * 1e18;
+    uint256  public constant RATE_PHASE2 = 1000 * 1e18;
 
-    uint256 public redemptionStart;
-    uint256 public redemptionEnd;
-    uint256 public redemptionRate;  // 1 token -> redemptionRate ETH (1e18 计)
+    uint256  public startTime;
+    uint256  public endTime;
+    uint256  public softCap;
+    uint256  public hardCap;
+    uint256  public cliffDuration;
+    uint256  public vestingDuration;
 
-    uint256 public totalRaised;
-    bool    public finalized;
+    uint256  public redemptionStart;
+    uint256  public redemptionEnd;
+    uint256  public redemptionRate;          // wei per token
+
+    uint256  public totalRaised;
+    bool     public finalized;
 
     struct Info {
-        uint256 contributed;
-        uint256 purchased;
-        uint256 claimed;
+        uint256 contributed;   // ETH paid-in
+        uint256 purchased;     // token amount (18-decimals)
+        uint256 claimed;       // token already vested & claimed
     }
     mapping(address => Info) public infos;
 
-    event RateUpdated(uint256 newRate);
+    /* --------------------------------------------------------------------- */
+    /* 事件                                                                   */
+    /* --------------------------------------------------------------------- */
     event TokensPurchased(address indexed buyer, uint256 ethAmt, uint256 tokenAmt);
     event Finalized(bool success);
-    event TokensClaimed(address indexed user, uint256 amount);
-    event RefundClaimed(address indexed user, uint256 amount);
-    event Redeemed(address indexed user, uint256 tokenAmt, uint256 ethAmt);
+    event TokensClaimed (address indexed user, uint256 amount);
+    event RefundClaimed (address indexed user, uint256 amount);
+    event Redeemed      (address indexed user, uint256 tokenAmt, uint256 ethAmt);
+    /** burn 前后余额一次性输出，便于审计 */
+    event Burned(uint256 icoBefore, uint256 ownerBefore, uint256 icoAfter, uint256 ownerAfter);
 
-    /**
-     * @param _token       ERC1155 合约地址
-     * @param _tokenId     售卖的 token ID
-     * @param _rate        初始汇率（1 ETH 可换多少 tokenUnits）
-     * @param _startTime   ICO 开始 unix 时间
-     * @param _endTime     ICO 结束 unix 时间
-     * @param _softCap     软顶（wei）
-     * @param _hardCap     硬顶（wei）
-     * @param _cliffDur    Cliff 时长（秒）
-     * @param _vestDur     Vesting 总时长（秒）
-     */
+    /* --------------------------------------------------------------------- */
+    /* 构造                                                                   */
+    /* --------------------------------------------------------------------- */
     constructor(
         address _token,
         uint256 _tokenId,
-        uint256 _rate,
-        uint256 _startTime,
-        uint256 _endTime,
+        uint256 _start,
+        uint256 _end,
         uint256 _softCap,
         uint256 _hardCap,
-        uint256 _cliffDur,
-        uint256 _vestDur
-    )
-        Ownable(msg.sender)               // <-- OZ v5.x 必需
-        ReentrancyGuard()                 // 可不写，留作示例
-        ERC1155Holder()
-    {
-        require(_startTime < _endTime, "start>=end");
-        require(_softCap <= _hardCap,   "soft>hard");
-        require(_vestDur >= _cliffDur,   "vest<cliff");
+        uint256 _cliff,
+        uint256 _vest
+    ) Ownable(msg.sender) ReentrancyGuard() ERC1155Holder() {
+        require(_start < _end,              "start>=end");
+        require(_softCap <= _hardCap,       "soft>hard");
+        require(_vest >= _cliff,            "vest<cliff");
 
         token           = IERC1155(_token);
         tokenId         = _tokenId;
-        rate            = _rate;
-        startTime       = _startTime;
-        endTime         = _endTime;
+        startTime       = _start;
+        endTime         = _end;
         softCap         = _softCap;
         hardCap         = _hardCap;
-        cliffDuration   = _cliffDur;
-        vestingDuration = _vestDur;
+        cliffDuration   = _cliff;
+        vestingDuration = _vest;
+    }
+
+    /* --------------------------------------------------------------------- */
+    /* 价格分段 & 购买                                                        */
+    /* --------------------------------------------------------------------- */
+    function currentRate() public view returns (uint256) {
+        uint256 mid = startTime + (endTime - startTime) / 2;
+        return block.timestamp <= mid ? RATE_PHASE1 : RATE_PHASE2;
     }
 
     modifier onlyWhileOpen() {
@@ -93,18 +94,11 @@ contract AdvancedICO1155 is Ownable, ReentrancyGuard, ERC1155Holder {
         _;
     }
 
-    /** 动态调整汇率 */
-    function setRate(uint256 newRate) external onlyOwner {
-        rate = newRate;
-        emit RateUpdated(newRate);
-    }
-
-    /** 购买，不立即发给 token，仅记录分配 */
     function buyTokens() external payable nonReentrant onlyWhileOpen {
-        require(msg.value > 0, "Zero ETH");
-        require(totalRaised + msg.value <= hardCap, "Exceeds hardCap");
+        require(msg.value > 0, "zero ETH");
+        require(totalRaised + msg.value <= hardCap, "exceeds hardCap");
 
-        uint256 tokenAmt = msg.value * rate / 1 ether;
+        uint256 tokenAmt = msg.value * currentRate() / 1 ether;
         Info storage inf = infos[msg.sender];
         inf.contributed += msg.value;
         inf.purchased   += tokenAmt;
@@ -113,79 +107,105 @@ contract AdvancedICO1155 is Ownable, ReentrancyGuard, ERC1155Holder {
         emit TokensPurchased(msg.sender, msg.value, tokenAmt);
     }
 
-    /** 结束 ICO，owner 调用 */
+    /* --------------------------------------------------------------------- */
+    /* Finalize / Refund                                                      */
+    /* --------------------------------------------------------------------- */
     function finalize() external onlyOwner {
-        require(!finalized, "Already done");
-        require(block.timestamp > endTime || totalRaised >= hardCap, "Not ended");
+        require(!finalized, "done");
+        require(block.timestamp > endTime || totalRaised >= hardCap, "not ended");
         finalized = true;
-        bool success = totalRaised >= softCap;
-        if (success) {
-            payable(owner()).transfer(address(this).balance);
-        }
-        emit Finalized(success);
+        emit Finalized(totalRaised >= softCap);
     }
 
-    /** 领取已解锁的 token (Cliff + Vesting) */
+    function claimRefund() external nonReentrant {
+        Info storage inf = infos[msg.sender];
+        require(finalized && totalRaised < softCap, "no refund");
+
+        uint256 amt = inf.contributed;
+        require(amt > 0, "none");
+        inf.contributed = 0;
+        payable(msg.sender).transfer(amt);
+        emit RefundClaimed(msg.sender, amt);
+    }
+
+    /* --------------------------------------------------------------------- */
+    /* Cliff + Vesting 领取                                                   */
+    /* --------------------------------------------------------------------- */
     function claimVested() external nonReentrant {
         Info storage inf = infos[msg.sender];
-        require(finalized && totalRaised >= softCap, "No success");
+        require(finalized && totalRaised >= softCap, "no success");
         uint256 elapsed = block.timestamp > endTime ? block.timestamp - endTime : 0;
-        require(elapsed >= cliffDuration, "Cliff");
+        require(elapsed >= cliffDuration, "cliff");
 
-        uint256 vested   = inf.purchased * min(elapsed, vestingDuration) / vestingDuration;
+        uint256 vested   = inf.purchased * _min(elapsed, vestingDuration) / vestingDuration;
         uint256 claimAmt = vested > inf.claimed ? vested - inf.claimed : 0;
-        require(claimAmt > 0, "Nothing");
+        require(claimAmt > 0, "nothing");
 
         inf.claimed += claimAmt;
         token.safeTransferFrom(owner(), msg.sender, tokenId, claimAmt, "");
         emit TokensClaimed(msg.sender, claimAmt);
     }
 
-    /** 失败退款 */
-    function claimRefund() external nonReentrant {
-        Info storage inf = infos[msg.sender];
-        require(finalized && totalRaised < softCap, "No refund");
-        uint256 amt = inf.contributed;
-        require(amt > 0, "None");
-        inf.contributed = 0;
-        payable(msg.sender).transfer(amt);
-        emit RefundClaimed(msg.sender, amt);
+    /* --------------------------------------------------------------------- */
+    /* 赎回窗口 / Redeem                                                      */
+    /* --------------------------------------------------------------------- */
+    function setRedemptionWindow(uint256 _start, uint256 _end, uint256 _rate) external onlyOwner {
+        require(_start < _end, "bad window");
+        redemptionStart = _start;
+        redemptionEnd   = _end;
+        redemptionRate  = _rate;
     }
 
-    /** 用户赎回：退 token 换 ETH（赎回期内） */
     function redeem(uint256 tokenAmt) external nonReentrant {
-        require(finalized && totalRaised >= softCap, "No redeem");
-        require(block.timestamp >= redemptionStart && block.timestamp <= redemptionEnd, "Window");
-        Info storage inf = infos[msg.sender];
-        require(inf.claimed >= tokenAmt, "Insufficient");
+        require(finalized && totalRaised >= softCap, "no redeem");
+        require(block.timestamp >= redemptionStart && block.timestamp <= redemptionEnd, "window");
 
+        Info storage inf = infos[msg.sender];
+        require(inf.claimed >= tokenAmt, "insufficient");
         inf.claimed -= tokenAmt;
+
         uint256 ethBack = tokenAmt * redemptionRate / 1 ether;
         token.safeTransferFrom(msg.sender, address(this), tokenId, tokenAmt, "");
         payable(msg.sender).transfer(ethBack);
         emit Redeemed(msg.sender, tokenAmt, ethBack);
     }
 
-    /** 设置赎回窗口 & 赎回率 */
-    function setRedemptionWindow(
-        uint256 _start,
-        uint256 _end,
-        uint256 _rateEthPerToken
-    ) external onlyOwner {
-        require(_start < _end, "bad window");
-        redemptionStart  = _start;
-        redemptionEnd    = _end;
-        redemptionRate   = _rateEthPerToken;
+    /* --------------------------------------------------------------------- */
+    /* Withdraw + 自动烧光                                                    */
+    /* --------------------------------------------------------------------- */
+    function withdraw() external onlyOwner {
+        require(finalized, "not finalized");
+        require(redemptionEnd == 0 || block.timestamp > redemptionEnd, "redeem not over");
+
+        payable(owner()).transfer(address(this).balance);
+        burnAllRemaining();                                // 成功路径自动烧光
     }
 
-    /** Owner 回收合约上的剩余 token，然后在 MyERC1155 调用 burn() 销毁 */
-    function burnUnsold() external onlyOwner {
-        uint256 bal = token.balanceOf(address(this), tokenId);
-        require(bal > 0, "no tokens");
-        token.safeTransferFrom(address(this), owner(), tokenId, bal, "");
+    /* --------------------------------------------------------------------- */
+    /* burnAllRemaining                                                       */
+    /* --------------------------------------------------------------------- */
+    function burnAllRemaining() public onlyOwner {
+        if (totalRaised < softCap) {
+            require(address(this).balance == 0, "refunds not done");
+        }
+
+        ERC1155Burnable burnable = ERC1155Burnable(address(token));
+
+        uint256 icoBefore   = token.balanceOf(address(this), tokenId);
+        uint256 ownerBefore = token.balanceOf(owner(),        tokenId);
+
+        if (icoBefore > 0)   burnable.burn(address(this), tokenId, icoBefore);
+        if (ownerBefore > 0) burnable.burn(owner(),        tokenId, ownerBefore);
+
+        uint256 icoAfter    = token.balanceOf(address(this), tokenId);
+        uint256 ownerAfter  = token.balanceOf(owner(),        tokenId);
+        emit Burned(icoBefore, ownerBefore, icoAfter, ownerAfter);
     }
 
-    function min(uint256 a, uint256 b) internal pure returns (uint256) {
+    /* --------------------------------------------------------------------- */
+    /* utils                                                                  */
+    /* --------------------------------------------------------------------- */
+    function _min(uint256 a, uint256 b) internal pure returns (uint256) {
         return a < b ? a : b;
     }
 }
