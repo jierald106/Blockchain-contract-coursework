@@ -1,0 +1,107 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.30;
+
+// 从 OpenZeppelin GitHub 导入
+import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v4.9.2/contracts/token/ERC1155/ERC1155.sol";
+import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v4.9.2/contracts/token/ERC1155/extensions/ERC1155Supply.sol";
+import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v4.9.2/contracts/access/Ownable.sol";
+
+contract ERC1155ICO is ERC1155, ERC1155Supply, Ownable {
+    uint256 public constant TOKEN_ID = 1;
+
+    struct RatePoint {
+        uint256 time;    // 时间戳
+        uint256 rate;    // 每 wei 可兑换的代币数量
+    }
+    RatePoint[] public rateSchedule;
+
+    mapping(address => uint256) public lockedAmount;
+    mapping(address => uint256) public unlockTime;
+
+    uint256 public redemptionRate;
+
+    event TokensPurchased(address indexed buyer, uint256 amount, uint256 costWei);
+    event TokensUnlocked(address indexed user, uint256 amount);
+    event TokensRedeemed(address indexed user, uint256 amount, uint256 refundWei);
+
+    constructor(
+        string memory uri_,
+        RatePoint[] memory initialSchedule,
+        uint256 _redemptionRate
+    ) ERC1155(uri_) {
+        // 初始化汇率阶段
+        for (uint i = 0; i < initialSchedule.length; i++) {
+            rateSchedule.push(initialSchedule[i]);
+        }
+        redemptionRate = _redemptionRate;
+    }
+
+    function addRatePoint(uint256 time_, uint256 rate_) external onlyOwner {
+        rateSchedule.push(RatePoint(time_, rate_));
+    }
+
+    function currentRate() public view returns (uint256) {
+        uint256 r = rateSchedule[0].rate;
+        for (uint i = 1; i < rateSchedule.length; i++) {
+            if (block.timestamp >= rateSchedule[i].time) {
+                r = rateSchedule[i].rate;
+            }
+        }
+        return r;
+    }
+
+    function buyTokens() external payable {
+        require(msg.value > 0, "Send ETH to buy tokens");
+        uint256 rate = currentRate();
+        uint256 amount = msg.value * rate;
+
+        _mint(msg.sender, TOKEN_ID, amount, "");
+        lockedAmount[msg.sender] += amount;
+        unlockTime[msg.sender] = block.timestamp + 600;//锁仓时间
+
+        emit TokensPurchased(msg.sender, amount, msg.value);
+    }
+
+    function unlockTokens() external {
+        require(block.timestamp >= unlockTime[msg.sender], "Tokens still locked");
+        uint256 amt = lockedAmount[msg.sender];
+        require(amt > 0, "No locked tokens");
+        lockedAmount[msg.sender] = 0;
+        emit TokensUnlocked(msg.sender, amt);
+    }
+
+    function burn(address account, uint256 id, uint256 value) external {
+        require(
+            account == msg.sender || isApprovedForAll(account, msg.sender),
+            "Not authorized"
+        );
+        _burn(account, id, value);
+    }
+
+    function redeem(uint256 amount) external {
+        require(
+            balanceOf(msg.sender, TOKEN_ID) - lockedAmount[msg.sender] >= amount,
+            "Not enough unlocked tokens"
+        );
+        _burn(msg.sender, TOKEN_ID, amount);
+        uint256 refund = amount / redemptionRate;
+        payable(msg.sender).transfer(refund);
+        emit TokensRedeemed(msg.sender, amount, refund);
+    }
+
+    function withdraw(address payable to) external onlyOwner {
+        to.transfer(address(this).balance);
+    }
+
+    // 为 ERC1155Supply 重写钩子
+    function _beforeTokenTransfer(
+        address operator,
+        address from,
+        address to,
+        uint256[] memory ids,
+        uint256[] memory amounts,
+        bytes memory data
+    ) internal override(ERC1155, ERC1155Supply) {
+        super._beforeTokenTransfer(operator, from, to, ids, amounts, data);
+    }
+}
