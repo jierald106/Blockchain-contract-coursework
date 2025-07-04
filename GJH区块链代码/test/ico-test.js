@@ -59,16 +59,13 @@ describe("GJHICO & GJHToken 基本功能测试", function () {
     expect(icoBal).to.equal(ethers.parseUnits("500000", 18));
   });
 
-  it("阶段性汇率正确", async function () {
-    // 第 1 天
+  it("固定汇率正确", async function () {
     await advanceTime(1);
     expect(await ico.currentRate()).to.equal(1000);
-
-    // 再过 2 天 ≈ 第 3 天
+  
     await advanceTime(2);
-    expect(await ico.currentRate()).to.equal(800);
-  });
-
+    expect(await ico.currentRate()).to.equal(1000);
+  }); 
   it("买币功能正常", async function () {
     await advanceTime(1);
     await ico.connect(user1).buyTokens({ value: ethers.parseEther("1") });

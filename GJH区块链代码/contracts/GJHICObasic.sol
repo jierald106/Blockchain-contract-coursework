@@ -7,17 +7,16 @@ import { IERC20 }           from "@openzeppelin/contracts/token/ERC20/IERC20.sol
 
 /**
  * @title GJHICO
- * @dev 三阶段汇率示例 ICO
+ * @dev 固定汇率示例 ICO（1000 token / ETH）
  */
 contract GJHICO is ReentrancyGuard, Ownable {
-    IERC20  public immutable token;            // 待售 ERC‑20
+    IERC20  public immutable token;            // 待售 ERC-20
     address payable public immutable treasury; // 收 ETH 的金库地址
 
     uint256 public immutable START;            // ICO 开始时间
     uint256 public immutable END;              // ICO 结束时间
 
-    uint256 private constant SECONDS_PER_DAY = 86_400;
-    uint256[3] private _rate = [1000, 800, 600]; // 分阶段价格
+    uint256 private constant RATE = 1_000;     // 固定汇率
 
     constructor(
         IERC20  _token,
@@ -25,7 +24,7 @@ contract GJHICO is ReentrancyGuard, Ownable {
         uint256 _start,
         uint256 _end
     )
-        Ownable(msg.sender)                    // <‑‑ v5.x 必须显式指定
+        Ownable(msg.sender)                    // <-- v5.x 需显式指定
     {
         require(_start > block.timestamp, "ICO: start in past");
         require(_end   > _start,        "ICO: bad time range");
@@ -37,15 +36,16 @@ contract GJHICO is ReentrancyGuard, Ownable {
     }
 
     /* ======== 读取函数 ======== */
-
-    /// 按当前时间段返回汇率；若不在售卖期则返回 0
+    /// 固定汇率版本的 currentRate：售卖期返回 RATE，其他时间返回 0
     function currentRate() public view returns (uint256) {
-        if (block.timestamp < START || block.timestamp > END) return 0;
+          return (block.timestamp >= START && block.timestamp <= END)
+           ? RATE
+           : 0;
+    }
 
-        uint256 elapsed = block.timestamp - START;
-        if (elapsed < 2 * SECONDS_PER_DAY) return _rate[0]; // 前 2 天
-        if (elapsed < 5 * SECONDS_PER_DAY) return _rate[1]; // 第 3‑5 天
-        return _rate[2];                                    // 其余天数
+    /// 是否处于售卖期
+    function isActive() public view returns (bool) {
+        return block.timestamp >= START && block.timestamp <= END;
     }
 
     /* ======== 买币逻辑 ======== */
@@ -53,12 +53,13 @@ contract GJHICO is ReentrancyGuard, Ownable {
     receive() external payable { buyTokens(); }
 
     function buyTokens() public payable nonReentrant {
+        // 现在固定汇率
         uint256 rate = currentRate();
-        require(rate > 0, "ICO: not active");
+        require(rate > 0, "ICO: not active");    // 售卖期外 currentRate() 会是 0
         require(msg.value > 0, "ICO: zero ETH");
 
         // 计算应得代币
-        uint256 tokenAmount = msg.value * rate;
+        uint256 tokenAmount = msg.value * rate;  // 1000 * ETH
         require(
             token.balanceOf(address(this)) >= tokenAmount,
             "ICO: sold out"
@@ -69,7 +70,7 @@ contract GJHICO is ReentrancyGuard, Ownable {
             token.transfer(msg.sender, tokenAmount),
             "ICO: token transfer failed"
         );
-        // ETH 暂时留在合约，由 owner 后续统一提取
+        // ETH 暂存于合约，由 owner 后续统一提取
     }
 
     /* ======== 收款 ======== */
